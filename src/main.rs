@@ -115,6 +115,193 @@ fn atom_view_position(atom: &Atom, camera: Camera) -> [f32; 3] {
 
     [x, y, view_z]
 }
+
+// CPU equivalent of the WGSL vertex shader's x/y projection.
+// Returned coordinates are in the same window-pixel coordinate system
+// consumed by MouseDownEvent::position.
+fn project_atom_to_screen(atom: &Atom, camera: Camera, viewport: Viewport) -> Option<(f32, f32)> {
+    if viewport.width <= 0.0 || viewport.height <= 0.0 || camera.zoom <= 0.0 {
+        return None;
+    }
+
+    let [x, y, _] = atom_view_position(atom, camera);
+    let aspect = viewport.width / viewport.height;
+    let ndc_x = (x + camera.pan_x) * camera.zoom / aspect;
+    let ndc_y = (y + camera.pan_y) * camera.zoom;
+
+    Some((
+        viewport.x + (ndc_x + 1.0) * viewport.width * 0.5,
+        viewport.y + (1.0 - ndc_y) * viewport.height * 0.5,
+    ))
+}
+
+// Orthographic ray/sphere picking. The shader maps smaller view-space Z
+// to smaller depth values and uses CompareFunction::Less, so the camera is
+// on the -Z side: rays travel along +Z and the smallest intersection t wins.
+fn pick_atom_at(
+    atoms: &[Atom],
+    camera: Camera,
+    viewport: Viewport,
+    screen_x: f32,
+    screen_y: f32,
+) -> Option<u64> {
+    if viewport.width <= 0.0
+        || viewport.height <= 0.0
+        || camera.zoom <= 0.0
+        || !screen_x.is_finite()
+        || !screen_y.is_finite()
+    {
+        return None;
+    }
+
+    let local_x = screen_x - viewport.x;
+    let local_y = screen_y - viewport.y;
+    if local_x < 0.0
+        || local_y < 0.0
+        || local_x > viewport.width
+        || local_y > viewport.height
+    {
+        return None;
+    }
+
+    let ndc_x = 2.0 * local_x / viewport.width - 1.0;
+    let ndc_y = 1.0 - 2.0 * local_y / viewport.height;
+    let aspect = viewport.width / viewport.height;
+    let ray_x = ndc_x * aspect / camera.zoom - camera.pan_x;
+    let ray_y = ndc_y / camera.zoom - camera.pan_y;
+
+    // Start before the closest (smallest-Z) sphere and travel toward +Z.
+    let min_view_z = atoms
+        .iter()
+        .map(|atom| atom_view_position(atom, camera)[2] - atom_radius(atom))
+        .fold(f32::INFINITY, f32::min);
+    if !min_view_z.is_finite() {
+        return None;
+    }
+    let ray_origin_z = min_view_z - 1.0;
+
+    atoms
+        .iter()
+        .filter_map(|atom| {
+            let center = atom_view_position(atom, camera);
+            let radius = atom_radius(atom);
+            let dx = ray_x - center[0];
+            let dy = ray_y - center[1];
+            let discriminant = radius * radius - dx * dx - dy * dy;
+            if discriminant < 0.0 {
+                return None;
+            }
+
+            let intersection_z = center[2] - discriminant.sqrt();
+            let t = intersection_z - ray_origin_z;
+            (t >= 0.0).then_some((t, atom.id))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, id)| id)
+}
+
+#[cfg(test)]
+mod picking_tests {
+    use super::*;
+
+    fn atom(id: u64, element: &str, x: f32, y: f32, z: f32) -> Atom {
+        Atom { id, element: element.into(), x, y, z }
+    }
+
+    fn viewport() -> Viewport {
+        Viewport { x: 13.0, y: 29.0, width: 868.0, height: 468.0 }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-3,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn projected_atom_center_can_be_picked() {
+        let a = atom(7, "C", 1.2, -0.7, 2.1);
+        let camera = Camera::default();
+        let viewport = viewport();
+        let (x, y) = project_atom_to_screen(&a, camera, viewport).unwrap();
+
+        assert_eq!(pick_atom_at(&[a], camera, viewport, x, y), Some(7));
+    }
+
+    #[test]
+    fn picking_round_trips_with_rotation_zoom_and_pan() {
+        let a = atom(42, "C", -1.3, 0.8, 2.4);
+        let camera = Camera {
+            yaw: 0.73,
+            pitch: -0.41,
+            zoom: 1.7,
+            pan_x: 0.23,
+            pan_y: -0.17,
+        };
+        let viewport = viewport();
+        let (x, y) = project_atom_to_screen(&a, camera, viewport).unwrap();
+
+        assert_eq!(pick_atom_at(&[a], camera, viewport, x, y), Some(42));
+    }
+
+    #[test]
+    fn sphere_edge_is_pickable_but_point_outside_is_not() {
+        let a = atom(3, "C", 0.0, 0.0, 0.0);
+        let camera = Camera::default();
+        let viewport = viewport();
+        let (center_x, center_y) = project_atom_to_screen(&a, camera, viewport).unwrap();
+
+        // The projected horizontal radius is radius * zoom / aspect.
+        let pixel_radius = atom_radius(&a) * camera.zoom
+            / (viewport.width / viewport.height) * viewport.width * 0.5;
+        assert_eq!(
+            pick_atom_at(&[a.clone()], camera, viewport, center_x + pixel_radius * 0.99, center_y),
+            Some(3)
+        );
+        assert_eq!(
+            pick_atom_at(&[a], camera, viewport, center_x + pixel_radius * 1.01, center_y),
+            None
+        );
+    }
+
+    #[test]
+    fn nearest_visible_sphere_wins() {
+        // Smaller view-space Z is closer according to the WGSL depth mapping.
+        let near = atom(1, "C", 0.0, 0.0, -1.0);
+        let far = atom(2, "C", 0.0, 0.0, 1.0);
+        let camera = Camera::default();
+        let viewport = viewport();
+        let (x, y) = project_atom_to_screen(&near, camera, viewport).unwrap();
+
+        assert_eq!(pick_atom_at(&[far, near], camera, viewport, x, y), Some(1));
+    }
+
+    #[test]
+    fn clicks_outside_viewport_do_not_pick() {
+        let a = atom(1, "C", 0.0, 0.0, 0.0);
+        assert_eq!(
+            pick_atom_at(&[a], Camera::default(), viewport(), 0.0, 0.0),
+            None
+        );
+    }
+
+    #[test]
+    fn hydrogen_uses_its_rendered_radius() {
+        let h = atom(9, "H", 0.0, 0.0, 0.0);
+        let camera = Camera::default();
+        let viewport = viewport();
+        let (x, y) = project_atom_to_screen(&h, camera, viewport).unwrap();
+
+        let c = atom(8, "C", 0.0, 0.0, 0.0);
+        let c_radius_px = atom_radius(&c) * camera.zoom
+            / (viewport.width / viewport.height) * viewport.width * 0.5;
+        assert_eq!(
+            pick_atom_at(&[h], camera, viewport, x + c_radius_px * 0.9, y),
+            None
+        );
+    }
+}
 fn mesh(m: &Molecule, selected: &[u64]) -> Vec<Vertex> {
     let mut v = Vec::new();
     for a in &m.atoms {
@@ -378,65 +565,16 @@ impl View {
 
     fn pick_atom(&self, position: Point<Pixels>) -> Option<u64> {
         let viewport = self.current_viewport();
-        if viewport.width <= 0.0 || viewport.height <= 0.0 {
-            return None;
-        }
-
-        let local_x = f32::from(position.x) - viewport.x;
-        let local_y = f32::from(position.y) - viewport.y;
-        if local_x < 0.0
-            || local_y < 0.0
-            || local_x > viewport.width
-            || local_y > viewport.height
-        {
-            return None;
-        }
-
         let camera = *self.camera.lock().unwrap();
         let molecule = self.molecule.lock().unwrap();
 
-        // Convert the pointer from viewport pixels to the same view-space
-        // coordinates used by the WGSL vertex shader.
-        let ndc_x = 2.0 * local_x / viewport.width - 1.0;
-        let ndc_y = 1.0 - 2.0 * local_y / viewport.height;
-        let aspect = viewport.width / viewport.height;
-        let ray_x = ndc_x * aspect / camera.zoom - camera.pan_x;
-        let ray_y = ndc_y / camera.zoom - camera.pan_y;
-
-        // The renderer is orthographic (clip-space w = 1), so the picking
-        // ray is parallel to view-space +Z. Start it in front of every atom.
-        let min_view_z = molecule
-            .atoms
-            .iter()
-            .map(|atom| atom_view_position(atom, camera)[2])
-            .fold(f32::INFINITY, f32::min);
-        if !min_view_z.is_finite() {
-            return None;
-        }
-        let ray_origin_z = min_view_z - 1.0;
-
-        molecule
-            .atoms
-            .iter()
-            .filter_map(|atom| {
-                let center = atom_view_position(atom, camera);
-                let radius = atom_radius(atom);
-
-                // Ray: (ray_x, ray_y, ray_origin_z) + t * (0, 0, 1).
-                // Solving the sphere equation gives the first visible
-                // intersection along the ray.
-                let dx = ray_x - center[0];
-                let dy = ray_y - center[1];
-                let discriminant = radius * radius - dx * dx - dy * dy;
-                if discriminant < 0.0 {
-                    return None;
-                }
-
-                let t = center[2] - discriminant.sqrt() - ray_origin_z;
-                (t >= 0.0).then_some((t, atom.id))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, id)| id)
+        pick_atom_at(
+            &molecule.atoms,
+            camera,
+            viewport,
+            f32::from(position.x),
+            f32::from(position.y),
+        )
     }
 
     fn update_selection(&mut self, new_selected: Vec<u64>) {
