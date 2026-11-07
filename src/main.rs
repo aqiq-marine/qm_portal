@@ -95,10 +95,30 @@ fn color(e: &str) -> [f32; 3] {
         _ => [0.7, 0.7, 0.75],
     }
 }
+
+fn atom_radius(atom: &Atom) -> f32 {
+    if atom.element == "H" { 0.16 } else { 0.25 }
+}
+
+// Apply the same yaw-then-pitch rotation as shade/molecule.wgsl.
+// Translation, zoom, and aspect are deliberately handled separately.
+fn atom_view_position(atom: &Atom, camera: Camera) -> [f32; 3] {
+    let cy = camera.yaw.cos();
+    let sy = camera.yaw.sin();
+    let x = atom.x * cy - atom.z * sy;
+    let z = atom.x * sy + atom.z * cy;
+
+    let cp = camera.pitch.cos();
+    let sp = camera.pitch.sin();
+    let y = atom.y * cp - z * sp;
+    let view_z = atom.y * sp + z * cp;
+
+    [x, y, view_z]
+}
 fn mesh(m: &Molecule, selected: &[u64]) -> Vec<Vertex> {
     let mut v = Vec::new();
     for a in &m.atoms {
-        let r = if a.element == "H" { 0.16 } else { 0.25 };
+        let r = atom_radius(a);
         let c = if selected.contains(&a.id) {
             [1.0, 0.9, 0.1]
         } else {
@@ -358,28 +378,62 @@ impl View {
 
     fn pick_atom(&self, position: Point<Pixels>) -> Option<u64> {
         let viewport = self.current_viewport();
-        let molecule = self.molecule.lock().unwrap();
-        let camera = *self.camera.lock().unwrap();
+        if viewport.width <= 0.0 || viewport.height <= 0.0 {
+            return None;
+        }
+
         let local_x = f32::from(position.x) - viewport.x;
         let local_y = f32::from(position.y) - viewport.y;
-        let click_x = 2.0 * local_x / viewport.width - 1.0;
-        let click_y = 1.0 - 2.0 * local_y / viewport.height;
+        if local_x < 0.0
+            || local_y < 0.0
+            || local_x > viewport.width
+            || local_y > viewport.height
+        {
+            return None;
+        }
+
+        let camera = *self.camera.lock().unwrap();
+        let molecule = self.molecule.lock().unwrap();
+
+        // Convert the pointer from viewport pixels to the same view-space
+        // coordinates used by the WGSL vertex shader.
+        let ndc_x = 2.0 * local_x / viewport.width - 1.0;
+        let ndc_y = 1.0 - 2.0 * local_y / viewport.height;
         let aspect = viewport.width / viewport.height;
+        let ray_x = ndc_x * aspect / camera.zoom - camera.pan_x;
+        let ray_y = ndc_y / camera.zoom - camera.pan_y;
+
+        // The renderer is orthographic (clip-space w = 1), so the picking
+        // ray is parallel to view-space +Z. Start it in front of every atom.
+        let min_view_z = molecule
+            .atoms
+            .iter()
+            .map(|atom| atom_view_position(atom, camera)[2])
+            .fold(f32::INFINITY, f32::min);
+        if !min_view_z.is_finite() {
+            return None;
+        }
+        let ray_origin_z = min_view_z - 1.0;
+
         molecule
             .atoms
             .iter()
             .filter_map(|atom| {
-                let cy = camera.yaw.cos();
-                let sy = camera.yaw.sin();
-                let x = atom.x * cy - atom.z * sy;
-                let z = atom.x * sy + atom.z * cy;
-                let cp = camera.pitch.cos();
-                let sp = camera.pitch.sin();
-                let y = atom.y * cp - z * sp;
-                let sx = (x + camera.pan_x) * camera.zoom / aspect;
-                let sy = (y + camera.pan_y) * camera.zoom;
-                let distance = ((sx - click_x).powi(2) + (sy - click_y).powi(2)).sqrt();
-                (distance < 0.08).then_some((distance, atom.id))
+                let center = atom_view_position(atom, camera);
+                let radius = atom_radius(atom);
+
+                // Ray: (ray_x, ray_y, ray_origin_z) + t * (0, 0, 1).
+                // Solving the sphere equation gives the first visible
+                // intersection along the ray.
+                let dx = ray_x - center[0];
+                let dy = ray_y - center[1];
+                let discriminant = radius * radius - dx * dx - dy * dy;
+                if discriminant < 0.0 {
+                    return None;
+                }
+
+                let t = center[2] - discriminant.sqrt() - ray_origin_z;
+                (t >= 0.0).then_some((t, atom.id))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, id)| id)
