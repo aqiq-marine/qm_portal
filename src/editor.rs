@@ -124,6 +124,9 @@ pub(crate) fn connected_fragment(
     get(molecule, root)?;
     let mut graph: HashMap<u64, Vec<u64>> = HashMap::new();
     for bond in &molecule.bonds {
+        if bond.order == BondType::None {
+            continue;
+        }
         let a = molecule
             .atoms
             .get(bond.from)
@@ -300,20 +303,23 @@ fn apply(molecule: &mut Molecule, command: EditCommand) -> Result<(), EditError>
                 return Err(EditError::InvalidValue);
             }
             let (_, pa) = get(molecule, from)?;
-            let (to_index, pb) = get(molecule, to)?;
+            let (_, pb) = get(molecule, to)?;
             let direction = (pb - pa).normalized()?;
             let delta = direction * (length - (pb - pa).norm());
             let ids = match move_selection {
                 MoveSelection::OneAtom => HashSet::from([to]),
                 MoveSelection::ConnectedFragment => {
-                    connected_fragment(molecule, to, Some((from, to)))?
+                    let res = connected_fragment(molecule, to, Some((from, to)))?;
+                    if res.contains(&from) {
+                        return Err(EditError::RingConstraint);
+                    }
+                    res
                 }
             };
             for id in ids {
                 let (index, p) = get(molecule, id)?;
                 set(molecule, index, p + delta);
             }
-            let _ = to_index;
         }
         EditCommand::SetBondAngle {
             a,
@@ -332,7 +338,11 @@ fn apply(molecule: &mut Molecule, command: EditCommand) -> Result<(), EditError>
             let ids = match move_selection {
                 MoveSelection::OneAtom => HashSet::from([c]),
                 MoveSelection::ConnectedFragment => {
-                    connected_fragment(molecule, c, Some((center, c)))?
+                    let res = connected_fragment(molecule, c, Some((center, c)))?;
+                    if res.contains(&center) {
+                        return Err(EditError::RingConstraint);
+                    }
+                    res
                 }
             };
             for id in ids {
@@ -435,7 +445,7 @@ mod tests {
                 from: 1,
                 to: 2,
                 length: 2.0,
-                move_selection: MoveSelection::OneAtom,
+                move_selection: MoveSelection::ConnectedFragment,
             },
         )
         .unwrap();
@@ -455,7 +465,7 @@ mod tests {
                 center: 1,
                 c: 3,
                 angle: std::f64::consts::FRAC_PI_4,
-                move_selection: MoveSelection::OneAtom,
+                move_selection: MoveSelection::ConnectedFragment,
             },
         )
         .unwrap();
@@ -531,6 +541,35 @@ mod tests {
         )
         .unwrap();
         assert!((dihedral(&m, 1, 2, 3, 4).unwrap() - std::f64::consts::FRAC_PI_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn bond_length_ring_constraint() {
+        let mut m = Molecule {
+            charge: 0,
+            spin: 1,
+            atoms: vec![
+                Atom { id: 1, element: "C".into(), x: 0.0, y: 0.0, z: 0.0 },
+                Atom { id: 2, element: "C".into(), x: 1.0, y: 0.0, z: 0.0 },
+                Atom { id: 3, element: "C".into(), x: 0.5, y: 1.0, z: 0.0 },
+            ],
+            bonds: vec![
+                Bond { id: 1, from: 0, to: 1, order: BondType::Single },
+                Bond { id: 2, from: 1, to: 2, order: BondType::Single },
+                Bond { id: 3, from: 2, to: 0, order: BondType::Single },
+            ],
+        };
+        let mut e = EditorState::new();
+        let res = e.apply(
+            &mut m,
+            EditCommand::SetBondLength {
+                from: 1,
+                to: 2,
+                length: 2.0,
+                move_selection: MoveSelection::ConnectedFragment,
+            },
+        );
+        assert_eq!(res, Err(EditError::RingConstraint));
     }
 
     #[test]

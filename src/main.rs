@@ -33,6 +33,7 @@ struct Atom {
 #[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum BondType {
+    None,
     Single,
     Double,
     Triple,
@@ -145,6 +146,7 @@ fn mesh(m: &Molecule, selected: &[u64]) -> Vec<Vertex> {
                 };
 
                 match b.order {
+                    BondType::None => {}
                     BondType::Single => {
                         add_cylinder(&mut v, p1, p2, 0.08, c, [0.0, 0.0, 0.0]);
                     }
@@ -367,6 +369,8 @@ struct View {
     last_pointer: Option<Point<Pixels>>,
     edit_mode: EditMode,
     numeric_buffer: String,
+    slider_last_x: Option<f32>,
+    slider_value: Option<f64>,
     fragment_mode: bool,
     debug_mode: bool,
     debug_compact: bool,
@@ -413,6 +417,8 @@ impl View {
 
     fn update_selection(&mut self, new_selected: Vec<u64>) {
         self.selected = new_selected;
+        self.slider_last_x = None;
+        self.slider_value = None;
         *self.selected_arc.lock().unwrap() = self.selected.clone();
     }
 
@@ -552,10 +558,11 @@ impl View {
                 return;
             };
             let next = match bond.order {
+                BondType::None => BondType::Single,
                 BondType::Single => BondType::Double,
                 BondType::Double => BondType::Triple,
                 BondType::Triple => BondType::Aromatic,
-                BondType::Aromatic => BondType::Single,
+                BondType::Aromatic => BondType::None,
             };
             (bond.id, next)
         };
@@ -569,12 +576,17 @@ impl View {
     }
 
     fn set_edit_mode(&mut self, mode: EditMode, cx: &mut Context<Self>) {
+        let previous_mode = self.edit_mode;
         match mode {
             EditMode::BondLength if self.selected.len() == 2 => self.edit_mode = mode,
             EditMode::BondAngle if self.selected.len() == 3 => self.edit_mode = mode,
             EditMode::Dihedral if self.selected.len() == 4 => self.edit_mode = mode,
             EditMode::Select => self.edit_mode = mode,
             _ => {}
+        }
+        if self.edit_mode != previous_mode {
+            self.slider_last_x = None;
+            self.slider_value = None;
         }
         cx.notify();
     }
@@ -618,23 +630,113 @@ impl View {
         }
     }
 
-    fn adjust_value(&mut self, delta: f64) {
-        let molecule = self.molecule.lock().unwrap();
-        let current = match self.edit_mode {
-            EditMode::BondLength if self.selected.len() == 2 => {
-                editor::distance(&molecule, self.selected[0], self.selected[1]).unwrap_or(1.0)
+    fn slider_range(&self) -> Option<(f64, f64)> {
+        match self.edit_mode {
+            EditMode::BondLength if self.selected.len() == 2 => Some((0.5, 4.0)),
+            EditMode::BondAngle if self.selected.len() == 3 => Some((0.0, 180.0)),
+            EditMode::Dihedral if self.selected.len() == 4 => Some((-180.0, 180.0)),
+            _ => None,
+        }
+    }
+
+    fn begin_slider(&mut self, x: f32) {
+        self.slider_last_x = Some(x);
+        if self.slider_value.is_none() {
+            if let (Some(value), Some((min, max))) = (self.current_edit_value(), self.slider_range()) {
+                self.slider_value = Some(value.clamp(min, max));
             }
-            EditMode::BondAngle if self.selected.len() == 3 => {
-                editor::angle(&molecule, self.selected[0], self.selected[1], self.selected[2]).unwrap_or(1.0).to_degrees()
-            }
-            EditMode::Dihedral if self.selected.len() == 4 => {
-                editor::dihedral(&molecule, self.selected[0], self.selected[1], self.selected[2], self.selected[3]).unwrap_or(0.0).to_degrees()
-            }
-            _ => return,
+        }
+    }
+
+    fn drag_slider(&mut self, x: f32) {
+        let Some(last_x) = self.slider_last_x else {
+            return;
         };
-        drop(molecule);
-        let new_val = current + delta;
-        self.apply_value(new_val);
+        let Some((min, max)) = self.slider_range() else {
+            return;
+        };
+        self.slider_last_x = Some(x);
+        let value_per_pixel = (max - min) / 280.0;
+        let Some(current) = self.slider_value.or_else(|| self.current_edit_value()) else {
+            return;
+        };
+        let next = (current + f64::from(x - last_x) * value_per_pixel).clamp(min, max);
+        self.slider_value = Some(next);
+        self.apply_value(next);
+    }
+
+    fn current_edit_value(&self) -> Option<f64> {
+        let molecule = self.molecule.lock().unwrap();
+        match self.edit_mode {
+            EditMode::BondLength if self.selected.len() == 2 => {
+                editor::distance(&molecule, self.selected[0], self.selected[1]).ok()
+            }
+            EditMode::BondAngle if self.selected.len() == 3 => editor::angle(
+                &molecule,
+                self.selected[0],
+                self.selected[1],
+                self.selected[2],
+            )
+            .ok()
+            .map(f64::to_degrees),
+            EditMode::Dihedral if self.selected.len() == 4 => editor::dihedral(
+                &molecule,
+                self.selected[0],
+                self.selected[1],
+                self.selected[2],
+                self.selected[3],
+            )
+            .ok()
+            .map(f64::to_degrees),
+            _ => None,
+        }
+    }
+
+    fn slider_knob_x(&self) -> Option<f32> {
+        let (min, max) = self.slider_range()?;
+        let value = self
+            .slider_value
+            .or_else(|| self.current_edit_value())?
+            .clamp(min, max);
+        Some(20.0 + ((value - min) / (max - min)) as f32 * 280.0)
+    }
+
+    fn slider_element(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .relative()
+            .w_80()
+            .h_6()
+            .bg(rgb(0x374151))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if event.pressed_button == Some(MouseButton::Left) {
+                    this.drag_slider(f32::from(event.position.x));
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .absolute()
+                    .left(px(20.0))
+                    .right(px(20.0))
+                    .top(px(11.0))
+                    .h(px(4.0))
+                    .bg(rgb(0x9ca3af)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(self.slider_knob_x().unwrap_or(20.0) - 7.0))
+                    .top(px(5.0))
+                    .w(px(14.0))
+                    .h(px(16.0))
+                    .bg(rgb(0x60a5fa))
+                    .border_1()
+                    .border_color(rgb(0xdbeafe))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.begin_slider(f32::from(event.position.x));
+                        cx.notify();
+                    })),
+            )
     }
 }
 impl Render for View {
@@ -788,91 +890,19 @@ impl Render for View {
                     )
                     .child(match self.edit_mode {
                         EditMode::BondLength if self.selected.len() == 2 => {
-                            div()
-                                .flex()
-                                .gap_4()
-                                .items_center()
+                            div().flex().gap_4().items_center()
                                 .child(format!("Bond Length: {}", current_val_str))
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x374151))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                            this.adjust_value(-0.1);
-                                            cx.notify();
-                                        }))
-                                        .child("-0.1")
-                                )
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x374151))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                            this.adjust_value(0.1);
-                                            cx.notify();
-                                        }))
-                                        .child("+0.1")
-                                )
+                                .child(self.slider_element(cx))
                         }
                         EditMode::BondAngle if self.selected.len() == 3 => {
-                            div()
-                                .flex()
-                                .gap_4()
-                                .items_center()
+                            div().flex().gap_4().items_center()
                                 .child(format!("Bond Angle: {}", current_val_str))
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x374151))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                            this.adjust_value(-5.0);
-                                            cx.notify();
-                                        }))
-                                        .child("-5°")
-                                )
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x374151))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                            this.adjust_value(5.0);
-                                            cx.notify();
-                                        }))
-                                        .child("+5°")
-                                )
+                                .child(self.slider_element(cx))
                         }
                         EditMode::Dihedral if self.selected.len() == 4 => {
-                            div()
-                                .flex()
-                                .gap_4()
-                                .items_center()
+                            div().flex().gap_4().items_center()
                                 .child(format!("Dihedral Angle: {}", current_val_str))
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x374151))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                            this.adjust_value(-5.0);
-                                            cx.notify();
-                                        }))
-                                        .child("-5°")
-                                )
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x374151))
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                                            this.adjust_value(5.0);
-                                            cx.notify();
-                                        }))
-                                        .child("+5°")
-                                )
+                                .child(self.slider_element(cx))
                         }
                         _ => div().child(format!("Mode: {} | {}", self.edit_mode.label(), current_val_str)),
                     })
@@ -1295,7 +1325,9 @@ fn main() {
                 last_pointer: None,
                 edit_mode: EditMode::Select,
                 numeric_buffer: String::new(),
-                fragment_mode: false,
+                slider_last_x: None,
+                slider_value: None,
+                fragment_mode: true,
                 debug_mode: false,
                 debug_compact: true,
                 viewport: Arc::new(Mutex::new(Viewport {
