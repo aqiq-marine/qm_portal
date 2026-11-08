@@ -549,4 +549,277 @@ mod tests {
         assert!(e.undo(&mut m));
         assert_eq!(m.bonds[0].order, BondType::Single);
     }
+
+    fn atom(id: u64, element: &str, x: f32, y: f32, z: f32) -> Atom {
+        Atom { id, element: element.into(), x, y, z }
+    }
+
+    fn viewport() -> PickViewport {
+        PickViewport { x: 13.0, y: 29.0, width: 868.0, height: 468.0 }
+    }
+
+    #[test]
+    fn projected_atom_center_can_be_picked() {
+        let a = atom(7, "C", 1.2, -0.7, 2.1);
+        let camera = Camera::default();
+        let viewport = viewport();
+        let (x, y) = project_atom_to_screen(&a, camera, viewport).unwrap();
+
+        assert_eq!(pick_atom_at(&[a], camera, viewport, x, y), Some(7));
+    }
+
+    #[test]
+    fn picking_round_trips_with_rotation_zoom_and_pan() {
+        let a = atom(42, "C", -0.3, 0.2, 0.4);
+        let camera = Camera {
+            yaw: 0.73,
+            pitch: -0.41,
+            zoom: 1.7,
+            ..Camera::default()
+        };
+        let viewport = viewport();
+        let (x, y) = project_atom_to_screen(&a, camera, viewport).unwrap();
+
+        assert_eq!(pick_atom_at(&[a], camera, viewport, x, y), Some(42));
+    }
+
+    #[test]
+    fn sphere_edge_is_pickable_but_point_outside_is_not() {
+        let a = atom(3, "C", 0.0, 0.0, 0.0);
+        let camera = Camera::default();
+        let viewport = viewport();
+        let (center_x, center_y) = project_atom_to_screen(&a, camera, viewport).unwrap();
+
+        let pixel_radius = atom_radius(&a) * camera.zoom
+            / (viewport.width / viewport.height) * viewport.width * 0.5;
+        assert_eq!(
+            pick_atom_at(&[a.clone()], camera, viewport, center_x + pixel_radius * 0.99, center_y),
+            Some(3)
+        );
+        assert_eq!(
+            pick_atom_at(&[a], camera, viewport, center_x + pixel_radius * 1.01, center_y),
+            None
+        );
+    }
+
+    #[test]
+    fn nearest_visible_sphere_wins() {
+        let near = atom(1, "C", 0.0, 0.0, -1.0);
+        let far = atom(2, "C", 0.0, 0.0, 1.0);
+        let camera = Camera::default();
+        let viewport = viewport();
+        let (x, y) = project_atom_to_screen(&near, camera, viewport).unwrap();
+
+        assert_eq!(pick_atom_at(&[far, near], camera, viewport, x, y), Some(1));
+    }
+
+    #[test]
+    fn clicks_outside_viewport_do_not_pick() {
+        let a = atom(1, "C", 0.0, 0.0, 0.0);
+        assert_eq!(
+            pick_atom_at(&[a], Camera::default(), viewport(), 0.0, 0.0),
+            None
+        );
+    }
+
+    #[test]
+    fn hydrogen_uses_its_rendered_radius() {
+        let h = atom(9, "H", 0.0, 0.0, 0.0);
+        let camera = Camera::default();
+        let viewport = viewport();
+        let (x, y) = project_atom_to_screen(&h, camera, viewport).unwrap();
+
+        let c = atom(8, "C", 0.0, 0.0, 0.0);
+        let c_radius_px = atom_radius(&c) * camera.zoom
+            / (viewport.width / viewport.height) * viewport.width * 0.5;
+        assert_eq!(
+            pick_atom_at(&[h], camera, viewport, x + c_radius_px * 0.9, y),
+            None
+        );
+    }
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct Camera {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub zoom: f32,
+    pub pan_x: f32,
+    pub pan_y: f32,
+    pub aspect: f32,
+}
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            yaw: 0.0,
+            pitch: 0.0,
+            zoom: 0.55,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            aspect: 868.0 / 468.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PickViewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+fn atom_radius(atom: &super::Atom) -> f32 {
+    if atom.element == "H" { 0.16 } else { 0.25 }
+}
+
+fn atom_view_position(atom: &super::Atom, camera: Camera) -> [f32; 3] {
+    let cy = camera.yaw.cos();
+    let sy = camera.yaw.sin();
+    let x = atom.x * cy - atom.z * sy;
+    let z = atom.x * sy + atom.z * cy;
+
+    let cp = camera.pitch.cos();
+    let sp = camera.pitch.sin();
+    let y = atom.y * cp - z * sp;
+    let view_z = atom.y * sp + z * cp;
+
+    [x, y, view_z]
+}
+
+pub(crate) fn project_atom_to_screen(atom: &super::Atom, camera: Camera, viewport: PickViewport) -> Option<(f32, f32)> {
+    if viewport.width <= 0.0 || viewport.height <= 0.0 || camera.zoom <= 0.0 {
+        return None;
+    }
+
+    let [x, y, _] = atom_view_position(atom, camera);
+    let aspect = viewport.width / viewport.height;
+    let ndc_x = (x + camera.pan_x) * camera.zoom / aspect;
+    let ndc_y = (y + camera.pan_y) * camera.zoom;
+
+    Some((
+        viewport.x + (ndc_x + 1.0) * viewport.width * 0.5,
+        viewport.y + (1.0 - ndc_y) * viewport.height * 0.5,
+    ))
+}
+
+pub(crate) fn pick_atom_at(
+    atoms: &[super::Atom],
+    camera: Camera,
+    viewport: PickViewport,
+    screen_x: f32,
+    screen_y: f32,
+) -> Option<u64> {
+    if viewport.width <= 0.0
+        || viewport.height <= 0.0
+        || camera.zoom <= 0.0
+        || !screen_x.is_finite()
+        || !screen_y.is_finite()
+    {
+        return None;
+    }
+
+    let local_x = screen_x - viewport.x;
+    let local_y = screen_y - viewport.y;
+    if local_x < 0.0
+        || local_y < 0.0
+        || local_x > viewport.width
+        || local_y > viewport.height
+    {
+        return None;
+    }
+
+    let ndc_x = 2.0 * local_x / viewport.width - 1.0;
+    let ndc_y = 1.0 - 2.0 * local_y / viewport.height;
+    let aspect = viewport.width / viewport.height;
+    let ray_x = ndc_x * aspect / camera.zoom - camera.pan_x;
+    let ray_y = ndc_y / camera.zoom - camera.pan_y;
+
+    let min_view_z = atoms
+        .iter()
+        .map(|atom| atom_view_position(atom, camera)[2] - atom_radius(atom))
+        .fold(f32::INFINITY, f32::min);
+    if !min_view_z.is_finite() {
+        return None;
+    }
+    let ray_origin_z = min_view_z - 1.0;
+
+    atoms
+        .iter()
+        .filter_map(|atom| {
+            let center = atom_view_position(atom, camera);
+            let radius = atom_radius(atom);
+            let dx = ray_x - center[0];
+            let dy = ray_y - center[1];
+            let discriminant = radius * radius - dx * dx - dy * dy;
+            if discriminant < 0.0 {
+                return None;
+            }
+
+            let intersection_z = center[2] - discriminant.sqrt();
+            let t = intersection_z - ray_origin_z;
+            (t >= 0.0).then_some((t, atom.id))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, id)| id)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AtomDebugInfo {
+    pub atom_id: u64,
+    pub element: String,
+    pub render_center: (f32, f32),
+    pub pick_center: (f32, f32),
+    pub diff: (f32, f32),
+    pub render_radius_px: (f32, f32),
+    pub pick_radius_px: (f32, f32),
+}
+
+pub(crate) fn collect_atom_debug_info(
+    atoms: &[super::Atom],
+    camera: Camera,
+    viewport: PickViewport,
+) -> Vec<AtomDebugInfo> {
+    let mut infos = Vec::new();
+    if viewport.width <= 0.0 || viewport.height <= 0.0 || camera.zoom <= 0.0 {
+        return infos;
+    }
+    let aspect = viewport.width / viewport.height;
+
+    for atom in atoms {
+        let Some(render_center) = project_atom_to_screen(atom, camera, viewport) else {
+            continue;
+        };
+        let center = atom_view_position(atom, camera);
+        let ndc_x = (center[0] + camera.pan_x) * camera.zoom / aspect;
+        let ndc_y = (center[1] + camera.pan_y) * camera.zoom;
+        let pick_center = (
+            viewport.x + (ndc_x + 1.0) * viewport.width * 0.5,
+            viewport.y + (1.0 - ndc_y) * viewport.height * 0.5,
+        );
+
+        let diff = (render_center.0 - pick_center.0, render_center.1 - pick_center.1);
+        let r = atom_radius(atom);
+
+        let render_radius_px = (
+            r * camera.zoom * viewport.width * 0.5 / aspect,
+            r * camera.zoom * viewport.height * 0.5,
+        );
+        let pick_radius_px = (
+            r * camera.zoom * viewport.width * 0.5 / aspect,
+            r * camera.zoom * viewport.height * 0.5,
+        );
+
+        infos.push(AtomDebugInfo {
+            atom_id: atom.id,
+            element: atom.element.clone(),
+            render_center,
+            pick_center,
+            diff,
+            render_radius_px,
+            pick_radius_px,
+        });
+    }
+    infos
+}
+
